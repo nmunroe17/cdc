@@ -66,16 +66,17 @@ def _collect_module_registers(design: DesignGraph) -> Dict[str, Dict[str, Regist
     return {module.name: module.registers for module in design.iter_modules()}
 
 
-def _is_synchronized(register: Register, module: Module) -> bool:
+def _is_synchronized(register: Register, module: Module, stage: str) -> bool:
     """Very small heuristic for detecting two-stage synchronizers."""
 
     for candidate in module.registers.values():
-        if candidate is register:
-            continue
         if candidate.clock != register.clock:
             continue
-        if candidate.drivers == {register.name}:
-            return True
+        for candidate_stage, drivers in candidate.iter_stage_drivers():
+            if candidate is register and candidate_stage == stage:
+                continue
+            if drivers == {stage}:
+                return True
     return False
 
 
@@ -86,23 +87,25 @@ def classify_crossings(design: DesignGraph) -> List[Crossing]:
     for module in design.iter_modules():
         for register in module.registers.values():
             target_domain = register.clock
-            for signal in sorted(register.drivers):
-                source_reg = module_regs[module.name].get(signal)
-                source_domain = source_reg.clock if source_reg else None
-                if source_domain == target_domain:
-                    continue
+            for stage, drivers in register.iter_stage_drivers():
+                for signal in sorted(drivers):
+                    base_signal = signal.split("[", 1)[0]
+                    source_reg = module_regs[module.name].get(base_signal)
+                    source_domain = source_reg.clock if source_reg else None
+                    if source_domain == target_domain:
+                        continue
 
                 safe = False
                 reason = "combinational path" if source_domain is None else "async source"
                 if source_domain != target_domain and target_domain is not None:
-                    if _is_synchronized(register, module):
+                    if _is_synchronized(register, module, stage):
                         safe = True
                         reason = "two-stage synchronizer"
                 crossings.append(
                     Crossing(
                         module=module.name,
                         signal=signal,
-                        register=register.name,
+                        register=stage,
                         source_domain=source_domain,
                         target_domain=target_domain,
                         safe=safe,
