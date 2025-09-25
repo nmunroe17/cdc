@@ -25,7 +25,17 @@ class Register:
     name: str
     module: str
     clock: Optional[str] = None
-    drivers: Set[str] = field(default_factory=set)
+    bit_indices: Optional[List[int]] = None
+    drivers: Dict[str, Set[str]] = field(default_factory=dict)
+
+    def record_drivers(self, stage: str, sources: Set[str]) -> None:
+        self.drivers.setdefault(stage, set()).update(sources)
+
+    def iter_stage_drivers(self) -> Iterable[tuple[str, Set[str]]]:
+        if self.drivers:
+            yield from self.drivers.items()
+        else:
+            yield (self.name, set())
 
 
 @dataclass
@@ -63,6 +73,53 @@ class DesignGraph:
         return None
 
 
+def _evaluate_int(node: vast.Node) -> Optional[int]:
+    if isinstance(node, vast.IntConst):
+        value = node.value.replace("_", "")
+        if "'" in value:
+            _, literal = value.split("'", 1)
+            if not literal:
+                return None
+            base_char = literal[0].lower()
+            digits = literal[1:]
+            base_map = {"b": 2, "h": 16, "o": 8, "d": 10}
+            base = base_map.get(base_char, 10)
+            if base_char not in base_map:
+                digits = literal
+            digits = digits or "0"
+            try:
+                return int(digits, base)
+            except ValueError:  # pragma: no cover - defensive
+                return None
+        else:
+            try:
+                return int(value, 0)
+            except ValueError:  # pragma: no cover - defensive
+                return None
+    return None
+
+
+def _bit_indices_from_width(width: Optional[vast.Width]) -> Optional[List[int]]:
+    if width is None:
+        return None
+    msb = _evaluate_int(width.msb)
+    lsb = _evaluate_int(width.lsb)
+    if msb is None or lsb is None:
+        return None
+    step = 1 if lsb >= msb else -1
+    # Include both endpoints.
+    stop = lsb + step
+    return list(range(msb, stop, step))
+
+
+def _flatten_concat(node: vast.Node) -> Iterable[vast.Node]:
+    if isinstance(node, vast.Concat):
+        for child in node.list or []:
+            yield from _flatten_concat(child)
+    else:
+        yield node
+
+
 class _IdentifierCollector(vast.NodeVisitor):
     """Collect identifier names used inside expressions."""
 
@@ -71,6 +128,17 @@ class _IdentifierCollector(vast.NodeVisitor):
 
     def visit_Identifier(self, node: vast.Identifier) -> None:  # pragma: no cover - trivial
         self.names.add(node.name)
+
+    def visit_Pointer(self, node: vast.Pointer) -> None:
+        if isinstance(node.var, vast.Identifier):
+            index = _evaluate_int(node.ptr)
+            if index is not None:
+                self.names.add(f"{node.var.name}[{index}]")
+            else:
+                self.names.add(node.var.name)
+        else:  # pragma: no cover - uncommon
+            self.visit(node.var)
+        self.visit(node.ptr)
 
     @classmethod
     def collect(cls, node: vast.Node) -> Set[str]:
@@ -126,10 +194,11 @@ class _DesignBuilder(vast.NodeVisitor):
     def visit_Decl(self, node: vast.Decl) -> None:
         for decl in node.list or []:
             if isinstance(decl, vast.Reg):
-                self.module.registers.setdefault(
+                register = self.module.registers.setdefault(
                     decl.name,
                     Register(name=decl.name, module=self.module.name),
                 )
+                register.bit_indices = _bit_indices_from_width(decl.width)
             elif isinstance(decl, vast.Wire):
                 self.module.nets.setdefault(
                     decl.name,
@@ -168,21 +237,54 @@ class _DesignBuilder(vast.NodeVisitor):
     def _handle_assignment(self, left: vast.Node, right: vast.Node) -> None:
         if not isinstance(left, vast.Lvalue):
             return
-        target = left.var
-        if isinstance(target, vast.Pointer):
-            target = target.var
-        if isinstance(target, vast.Identifier):
-            name = target.name
-        else:
+        targets = self._resolve_targets(left.var)
+        if not targets:
             return
 
-        register = self.module.registers.get(name)
-        if register is None:
-            return
-        clock = self.current_clock
-        if clock is not None and register.clock is None:
-            register.clock = clock
-        register.drivers.update(_IdentifierCollector.collect(right))
+        for register, stage, expr in self._pair_targets_with_rhs(targets, right):
+            clock = self.current_clock
+            if clock is not None and register.clock is None:
+                register.clock = clock
+            register.record_drivers(stage, _IdentifierCollector.collect(expr))
+
+    def _resolve_targets(self, node: vast.Node) -> List[tuple[Register, str]]:
+        if isinstance(node, vast.Pointer):
+            if not isinstance(node.var, vast.Identifier):
+                return []
+            base = node.var.name
+            register = self.module.registers.get(base)
+            if register is None:
+                return []
+            index = _evaluate_int(node.ptr)
+            stage = f"{base}[{index}]" if index is not None else base
+            return [(register, stage)]
+
+        if isinstance(node, vast.Identifier):
+            register = self.module.registers.get(node.name)
+            if register is None:
+                return []
+            return [(register, node.name)]
+
+        return []
+
+    def _pair_targets_with_rhs(
+        self,
+        targets: List[tuple[Register, str]],
+        right: vast.Node,
+    ) -> Iterable[tuple[Register, str, vast.Node]]:
+        if len(targets) != 1:
+            return [(register, stage, right) for register, stage in targets]
+
+        register, stage = targets[0]
+        if stage == register.name and register.bit_indices and isinstance(right, vast.Concat):
+            elements = list(_flatten_concat(right))
+            if len(elements) == len(register.bit_indices):
+                paired = []
+                for index, expr in zip(register.bit_indices, elements):
+                    bit_stage = f"{register.name}[{index}]"
+                    paired.append((register, bit_stage, expr))
+                return paired
+        return [(register, stage, right)]
 
 
 def parse_design(files: Sequence[Path]) -> DesignGraph:
