@@ -158,11 +158,29 @@ class _DesignBuilder(vast.NodeVisitor):
     # Internal helpers --------------------------------------------------------
     def _extract_clock(self, node: vast.Always) -> Optional[str]:
         sens = node.sens_list
-        if isinstance(sens, vast.SensList):
-            for entry in sens.list:
-                if isinstance(entry, vast.Sens) and entry.type in {"posedge", "negedge"}:
-                    if isinstance(entry.sig, vast.Identifier):
-                        return entry.sig.name
+        if not isinstance(sens, vast.SensList):
+            return None
+
+        candidates: List[str] = []
+
+        def _looks_like_reset(name: str) -> bool:
+            lowered = name.lower()
+            return any(token in lowered for token in ("rst", "reset", "areset", "srst", "clr"))
+
+        for entry in sens.list:
+            if not isinstance(entry, vast.Sens):
+                continue
+            if entry.type not in {"posedge", "negedge"}:
+                continue
+            if not isinstance(entry.sig, vast.Identifier):
+                continue
+            signal = entry.sig.name
+            candidates.append(signal)
+            if not _looks_like_reset(signal):
+                return signal
+
+        if candidates:
+            return candidates[-1]
         return None
 
     def _handle_assignment(self, left: vast.Node, right: vast.Node) -> None:
